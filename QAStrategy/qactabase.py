@@ -11,6 +11,7 @@ import uuid
 import pandas as pd
 import pymongo
 import requests
+import asyncio
 from qaenv import (eventmq_amqp, eventmq_ip, eventmq_password, eventmq_port,
                    eventmq_username, mongo_ip, mongo_uri)
 from QAPUBSUB.consumer import subscriber, subscriber_routing, subscriber_topic
@@ -22,10 +23,12 @@ from QIFIAccount import ORDER_DIRECTION, QIFI_Account
 from QUANTAXIS.QAARP import QA_Risk, QA_User
 from QUANTAXIS.QAEngine.QAThreadEngine import QA_Thread
 from QUANTAXIS.QAUtil.QAParameter import MARKET_TYPE, RUNNING_ENVIRONMENT
+from QUANTAXIS.QAData.QADataStruct import QA_DataStruct_Stock_min
 
 
 class QAStrategyCTABase():
-    def __init__(self, code='rb2005', frequence='1min', strategy_id='QA_STRATEGY', risk_check_gap=1, portfolio='default',
+    def __init__(self, code='rb2005', frequence='1min', strategy_id='QA_STRATEGY', risk_check_gap=1,
+                 portfolio='default',
                  start='2020-01-01', end='2020-05-21', init_cash=1000000, send_wx=False,
                  data_host=eventmq_ip, data_port=eventmq_port, data_user=eventmq_username, data_password=eventmq_password,
                  trade_host=eventmq_ip, trade_port=eventmq_port, trade_user=eventmq_username, trade_password=eventmq_password,
@@ -99,30 +102,32 @@ class QAStrategyCTABase():
         self._num_cached = 120
         self._cached_data = []
         self.user_init()
+        # 实盘参数
+        self.stop_actual_thread = True
+        self.actual_thread: threading.Thread = None
+        self.stock_name = 'stock_name_un_set'
 
     @property
     def bar_id(self):
         return len(self._market_data)
 
-
     @property
     def BarsSinceEntryLong(self):
-      return self.bar_id - self.bar_order.get('BUY_OPEN', self.bar_id)
+        return self.bar_id - self.bar_order.get('BUY_OPEN', self.bar_id)
 
     @property
     def BarsSinceEntryShort(self):
-      return self.bar_id - self.bar_order.get('SELL_OPEN', self.bar_id)
-
+        return self.bar_id - self.bar_order.get('SELL_OPEN', self.bar_id)
 
     @property
     def EntryPriceLong(self):
-      code = self.get_code()
-      return self.get_positions(code).open_price_long
+        code = self.get_code()
+        return self.get_positions(code).open_price_long
+
     @property
     def EntryPriceShort(self):
-      code = self.get_code()
-      return self.get_positions(code).open_price_short
-
+        code = self.get_code()
+        return self.get_positions(code).open_price_short
 
     def on_sync(self):
         if self.running_mode != 'backtest':
@@ -137,15 +142,20 @@ class QAStrategyCTABase():
 
             if isinstance(self.code, str):
                 self._old_data = QA.QA_fetch_get_future_min('tdx', self.code.upper(), QA.QA_util_get_last_day(
-                    QA.QA_util_get_real_date(str(datetime.date.today()))), str(datetime.datetime.now()), self.frequence)[:-1].set_index(['datetime', 'code'])
+                    QA.QA_util_get_real_date(str(datetime.date.today()))), str(datetime.datetime.now()),
+                                                            self.frequence)[:-1].set_index(['datetime', 'code'])
                 self._old_data = self._old_data.assign(volume=self._old_data.trade).loc[:, [
-                    'open', 'high', 'low', 'close', 'volume']]
+                                                                                               'open', 'high', 'low',
+                                                                                               'close', 'volume']]
             else:
 
                 self._old_data = pd.concat([QA.QA_fetch_get_future_min('tdx', item.upper(), QA.QA_util_get_last_day(
-                    QA.QA_util_get_real_date(str(datetime.date.today()))), str(datetime.datetime.now()), self.frequence)[:-1].set_index(['datetime', 'code']) for item in self.code], sort=False)
+                    QA.QA_util_get_real_date(str(datetime.date.today()))), str(datetime.datetime.now()),
+                                                                       self.frequence)[:-1].set_index(
+                    ['datetime', 'code']) for item in self.code], sort=False)
                 self._old_data = self._old_data.assign(volume=self._old_data.trade).loc[:, [
-                    'open', 'high', 'low', 'close', 'volume']]
+                                                                                               'open', 'high', 'low',
+                                                                                               'close', 'volume']]
         else:
             self._old_data = pd.DataFrame()
 
@@ -175,6 +185,104 @@ class QAStrategyCTABase():
             {'strategy_id': self.strategy_id},
             {'strategy_id': self.strategy_id, 'taskid': self.taskid,
              'filepath': os.path.abspath(__file__), 'status': 200}, upsert=True)
+
+    def debug_actual(self):
+        print(f'{self.code} enter debug actual 开始调试实盘.')
+        self.actual_thread = threading.Thread(target=self.run_actual_sim_loop, daemon=True)
+        self.actual_thread.start()
+        self.actual_thread.join()
+
+    def loop_actual_tick(self):
+        last_ts = self.actual_tick_check()
+
+    async def loop_actual_async(self):
+        print(f'{self.code} enter debug actual 开始asyncio实盘.')
+        await self.run_async_actual_loop()
+
+    async def run_async_actual_loop(self):
+        self.stop_actual_thread = False
+        self.ready_sleep = 1
+        while not self.stop_actual_thread:
+            # print(f'{self.code} qa cta base run loop. {"Daemon" if self.actual_thread.isDaemon() else "not Daemon"} Thread.')
+            last_ts = self.actual_tick_check()
+            now_ts = datetime.datetime.now()
+            timedelta = last_ts + datetime.timedelta(minutes=5) - now_ts
+            #
+            if timedelta > datetime.timedelta(seconds=5):
+                self.ready_sleep = timedelta.seconds - 3
+            else:
+                self.ready_sleep = 1
+            #     如果当前时间超过下午3点, 则休眠10分钟, 或者在早上9点之前, 则休眠5分钟
+            if datetime.time(hour=9, minute=5) > now_ts.time() or now_ts.time() > datetime.time(hour=15, minute=10):
+                next_wakeup_time = datetime.datetime.combine(now_ts.date() + datetime.timedelta(days=1), datetime.time(hour=9, minute=5))
+                self.ready_sleep = (next_wakeup_time - now_ts).seconds
+            print(f'{datetime.datetime.now()} {self.code} ready sleep  {self.ready_sleep}')
+            await asyncio.sleep(self.ready_sleep)
+
+    def run_actual_sim_loop(self):
+        self.stop_actual_thread = False
+        self.ready_sleep = 1
+        while not self.stop_actual_thread:
+            # print(f'{self.code} qa cta base run loop. {"Daemon" if self.actual_thread.isDaemon() else "not Daemon"} Thread.')
+            last_ts = self.actual_tick_check()
+            now_ts = datetime.datetime.now()
+            timedelta = last_ts + datetime.timedelta(minutes=5) - now_ts
+            #
+            if timedelta > datetime.timedelta(seconds=5):
+                self.ready_sleep = timedelta.seconds - 3
+            else:
+                self.ready_sleep = 1
+            #     如果当前时间超过下午3点, 则休眠10分钟, 或者在早上9点之前, 则休眠5分钟
+            if datetime.time(hour=9, minute=5) > now_ts.time() or now_ts.time() > datetime.time(hour=15, minute=10):
+                self.ready_sleep = 60 * 10
+            print(f'{datetime.datetime.now()} {self.code} ready sleep  {self.ready_sleep}')
+            time.sleep(self.ready_sleep)
+
+    def actual_tick_check(self):
+        if len(self._market_data) == 0:
+            return
+        last_index = self.market_data.index[-1]
+        code = last_index[1]
+        last_timestamp = last_index[0]
+
+        # 获取当前时间
+        now_timestamp = datetime.datetime.now()
+        now_str = str(now_timestamp)[:19]
+
+        # print(f'当前股票的代码是 {self.code}')
+        # print(f'{now_str}: 当前股票最后一条的数据时间是 {last_timestamp}')
+
+        res = QA.QAFetch.QATdx.QA_fetch_get_stock_min(code, last_timestamp, now_str, '5min')
+        res = res.rename(columns={"vol": "volume"})
+                         # .drop(
+                         # ['date', 'datetime', 'date_stamp', 'time_stamp'], axis=1)
+
+        # res.index = pd.to_datetime(res.index)
+        res = QA_DataStruct_Stock_min(res.set_index(['datetime', 'code']))
+        apply_data: QA_DataStruct_Stock_min = res
+        apply_df: pd.DataFrame = apply_data.data
+        # 这里要删除多余的 index, 比如时间是重复的, 还有当前时间未达到那个时间戳.
+        drop_index = []
+        cut_timestamp = now_timestamp - datetime.timedelta(hours=3)
+        cut_str = str(cut_timestamp)[:19]
+        cut_str = now_str
+        for index, row in apply_df.iterrows():
+            str_index_ts = str(last_index[0])
+            if index[0] <= str_index_ts or index[0] > cut_str:
+                drop_index.append(index)
+            else:
+                # print(f'{self.code} fetch new data with timestamp {index[0]}')
+                pass
+        apply_df = apply_df.drop(index=drop_index)
+        # print(data)
+        # 重新取一次timestamp
+        apply_df.apply(self.x1, axis=1)
+        last_index = self.market_data.index[-1]
+        code = last_index[1]
+        last_timestamp = last_index[0]
+        if isinstance(last_timestamp, str):
+            last_timestamp = datetime.datetime.strptime(last_timestamp, '%Y-%m-%d %H:%M:%S')
+        return last_timestamp
 
     def debug_sim(self):
         self._debug_sim()
@@ -206,6 +314,7 @@ class QAStrategyCTABase():
         """
         用户自定义的init过程
         """
+
         pass
 
     def debug(self):
@@ -230,7 +339,7 @@ class QAStrategyCTABase():
             self.on_dailyclose()
             self.on_dailyopen()
             if self.market_type == QA.MARKET_TYPE.STOCK_CN:
-                print('backtest: Settle!')
+                print(f'backtest: Settle! {self.code} {str(item.name[0])[0:10]}')
                 self.acc.settle()
         self._on_1min_bar()
         self._market_data.append(item)
@@ -276,11 +385,11 @@ class QAStrategyCTABase():
         user = QA_User(username=self.username, password=self.password)
         port = user.new_portfolio(self.portfolio)
         self.strategy_id = self.strategy_id + \
-            'currenttick_{}_{}'.format(str(datetime.date.today()), freq)
+                           'currenttick_{}_{}'.format(str(datetime.date.today()), freq)
         self.acc = port.new_accountpro(
             account_cookie=self.strategy_id, init_cash=self.init_cash, market_type=self.market_type)
         self.positions = self.acc.get_position(self.code)
-        data = data.assign(price=data.price/1000).loc[:, ['code', 'price', 'volume']].resample(
+        data = data.assign(price=data.price / 1000).loc[:, ['code', 'price', 'volume']].resample(
             freq).apply({'code': 'last', 'price': 'ohlc', 'volume': 'sum'}).dropna()
         data.columns = data.columns.droplevel(0)
         data = data.reset_index().set_index(['datetime', 'code'])
@@ -305,11 +414,11 @@ class QAStrategyCTABase():
         user = QA_User(username=self.username, password=self.password)
         port = user.new_portfolio(self.portfolio)
         self.strategy_id = self.strategy_id + \
-            'histick_{}_{}_{}'.format(self.start, self.end, freq)
+                           'histick_{}_{}_{}'.format(self.start, self.end, freq)
         self.acc = port.new_accountpro(
             account_cookie=self.strategy_id, init_cash=self.init_cash, market_type=self.market_type)
         self.positions = self.acc.get_position(self.code)
-        data = data.assign(price=data.price/1000).loc[:, ['code', 'price', 'volume']].resample(
+        data = data.assign(price=data.price / 1000).loc[:, ['code', 'price', 'volume']].resample(
             freq).apply({'code': 'last', 'price': 'ohlc', 'volume': 'sum'}).dropna()
         data.columns = data.columns.droplevel(0)
         data = data.reset_index().set_index(['datetime', 'code'])
@@ -345,7 +454,7 @@ class QAStrategyCTABase():
         elif frequence.endswith('s'):
 
             import re
-            self._num_cached = 2*int(re.findall(r'\d+', self.frequence)[0])
+            self._num_cached = 2 * int(re.findall(r'\d+', self.frequence)[0])
             self.sub = subscriber_routing(
                 exchange='CTPX', routing_key=code, host=data_host, port=data_port, user=data_user, password=data_password)
             self.sub.callback = self.second_callback
@@ -359,13 +468,15 @@ class QAStrategyCTABase():
         if frequence.endswith('min'):
             if model == 'rust':
                 self.sub = subscriber_routing(exchange='realtime_{}'.format(
-                    codelist[0]), routing_key=frequence, host=data_host, port=data_port, user=data_user, password=data_password)
+                    codelist[0]), routing_key=frequence, host=data_host, port=data_port, user=data_user,
+                    password=data_password)
                 for item in codelist[1:]:
                     self.sub.add_sub(exchange='realtime_{}'.format(
                         item), routing_key=frequence)
             elif model == 'py':
                 self.sub = subscriber_routing(exchange='realtime_{}'.format(
-                    codelist[0].lower()), routing_key=frequence, host=data_host, port=data_port, user=data_user, password=data_password)
+                    codelist[0].lower()), routing_key=frequence, host=data_host, port=data_port, user=data_user,
+                    password=data_password)
                 for item in codelist[1:]:
                     self.sub.add_sub(exchange='realtime_{}'.format(
                         item.lower()), routing_key=frequence)
@@ -496,18 +607,17 @@ class QAStrategyCTABase():
 
         self._cached_data.append(self.new_data)
         self.latest_price[self.new_data['symbol']
-                          ] = self.new_data['last_price']
+        ] = self.new_data['last_price']
 
         # if len(self._cached_data) == self._num_cached:
         #     self.isupdate = True
 
-
-        if len(self._cached_data) > 3*self._num_cached:
+        if len(self._cached_data) > 3 * self._num_cached:
             # 控制缓存数据量
             self._cached_data = self._cached_data[self._num_cached:]
 
         data = pd.DataFrame(self._cached_data).loc[:, [
-            'datetime', 'last_price', 'volume']]
+                                                          'datetime', 'last_price', 'volume']]
         data = data.assign(datetime=pd.to_datetime(data.datetime)).set_index('datetime').resample(
             self.frequence).apply({'last_price': 'ohlc', 'volume': 'last'}).dropna()
         data.columns = data.columns.droplevel(0)
@@ -534,7 +644,7 @@ class QAStrategyCTABase():
     def tick_callback(self, a, b, c, body):
         self.new_data = json.loads(str(body, encoding='utf-8'))
         self.latest_price[self.new_data['symbol']
-                          ] = self.new_data['last_price']
+        ] = self.new_data['last_price']
         self.running_time = self.new_data['datetime']
         self.on_tick(self.new_data)
 
@@ -620,7 +730,7 @@ class QAStrategyCTABase():
         raise NotImplementedError
 
     def _on_1min_bar(self):
-        #raise NotImplementedError
+        # raise NotImplementedError
         if len(self._systemvar.keys()) > 0:
             self._signal.append(copy.deepcopy(self._systemvar))
         try:
@@ -709,11 +819,14 @@ class QAStrategyCTABase():
         self.send_order(direction=direction, offset=offset,
                         volume=trade_amount, price=trade_price, order_id=QA.QA_util_random_with_topic(self.strategy_id))
 
-    def send_order(self,  direction='BUY', offset='OPEN', price=3925, volume=10, order_id='', code=None):
+    def send_order(self, direction='BUY', offset='OPEN', price=3925, volume=10, order_id='', code=None):
         if code == None:
             code = self.get_code()
 
-        towards = eval('ORDER_DIRECTION.{}_{}'.format(direction, offset))
+        if offset == '':
+            towards = eval('ORDER_DIRECTION.{}'.format(direction))
+        else:
+            towards = eval('ORDER_DIRECTION.{}_{}'.format(direction, offset))
         order_id = str(uuid.uuid4()) if order_id == '' else order_id
 
         if isinstance(price, float):
@@ -723,14 +836,15 @@ class QAStrategyCTABase():
 
         if self.running_mode == 'sim':
             # 在此处拦截无法下单的订单
-            if (direction == 'BUY' and self.latest_price[code] <= price) or (direction == 'SELL' and self.latest_price[code] >= price):
+            if (direction == 'BUY' and self.latest_price[code] <= price) or (
+                    direction == 'SELL' and self.latest_price[code] >= price):
                 QA.QA_util_log_info(
                     '============ {} SEND ORDER =================='.format(order_id))
                 QA.QA_util_log_info('direction{} offset {} price{} volume{}'.format(
                     direction, offset, price, volume))
 
                 if self.check_order(direction, offset, code=code):
-                    #self.last_order_towards = {'BUY': '', 'SELL': ''}
+                    # self.last_order_towards = {'BUY': '', 'SELL': ''}
                     self.last_order_towards[code][direction] = offset
                     now = str(datetime.datetime.now())
 
@@ -749,8 +863,10 @@ class QAStrategyCTABase():
                         for user in self.subscriber_list:
                             QA.QA_util_log_info(self.subscriber_list)
                             try:
-                                requests.post('http://www.yutiansut.com/signal?user_id={}&template={}&strategy_id={}&realaccount={}&code={}&order_direction={}&order_offset={}&price={}&volume={}&order_time={}'.format(
-                                    user, "xiadan_report", self.strategy_id, self.acc.user_id, code.lower(), direction, offset, price, volume, now))
+                                requests.post(
+                                    'http://www.yutiansut.com/signal?user_id={}&template={}&strategy_id={}&realaccount={}&code={}&order_direction={}&order_offset={}&price={}&volume={}&order_time={}'.format(
+                                        user, "xiadan_report", self.strategy_id, self.acc.user_id, code.lower(),
+                                        direction, offset, price, volume, now))
                             except Exception as e:
                                 QA.QA_util_log_info(e)
 
@@ -770,7 +886,8 @@ class QAStrategyCTABase():
                 self.on_deal(order.to_dict())
             else:
                 self.acc.receive_simpledeal(
-                    code=code, trade_time=self.running_time, trade_towards=towards, trade_amount=volume, trade_price=price, order_id=order_id, realorder_id=order_id, trade_id=order_id)
+                    code=code, trade_time=self.running_time, trade_towards=towards, trade_amount=volume,
+                    trade_price=price, order_id=order_id, realorder_id=order_id, trade_id=order_id)
 
                 self.on_deal({
                     'code': code,
