@@ -93,8 +93,11 @@ class QAStrategyCTABase():
             self.market_type = MARKET_TYPE.FUTURE_CN if re.search(
                 r'[a-zA-z]+', self.code) else MARKET_TYPE.STOCK_CN
         else:
-            self.market_type = MARKET_TYPE.FUTURE_CN if re.search(
-                r'[a-zA-z]+', self.code[0]) else MARKET_TYPE.STOCK_CN
+            if re.match(r'\d+.XSHG', self.code[0]):
+                self.market_type = MARKET_TYPE.STOCK_CN
+            else:
+                self.market_type = MARKET_TYPE.FUTURE_CN if re.search(
+                    r'[a-zA-z]+', self.code[0]) else MARKET_TYPE.STOCK_CN
 
         self.bar_order = {'BUY_OPEN': 0, 'SELL_OPEN': 0,
                           'BUY_CLOSE': 0, 'SELL_CLOSE': 0}
@@ -254,8 +257,8 @@ class QAStrategyCTABase():
 
         res = QA.QAFetch.QATdx.QA_fetch_get_stock_min(code, last_timestamp, now_str, '5min')
         res = res.rename(columns={"vol": "volume"})
-                         # .drop(
-                         # ['date', 'datetime', 'date_stamp', 'time_stamp'], axis=1)
+        # .drop(
+        # ['date', 'datetime', 'date_stamp', 'time_stamp'], axis=1)
 
         # res.index = pd.to_datetime(res.index)
         res = QA_DataStruct_Stock_min(res.set_index(['datetime', 'code']))
@@ -263,12 +266,9 @@ class QAStrategyCTABase():
         apply_df: pd.DataFrame = apply_data.data
         # 这里要删除多余的 index, 比如时间是重复的, 还有当前时间未达到那个时间戳.
         drop_index = []
-        cut_timestamp = now_timestamp - datetime.timedelta(hours=3)
-        cut_str = str(cut_timestamp)[:19]
-        cut_str = now_str
         for index, row in apply_df.iterrows():
             str_index_ts = str(last_index[0])
-            if index[0] <= str_index_ts or index[0] > cut_str:
+            if index[0] <= str_index_ts:
                 drop_index.append(index)
             else:
                 # print(f'{self.code} fetch new data with timestamp {index[0]}')
@@ -295,8 +295,8 @@ class QAStrategyCTABase():
 
     def run_backtest(self):
         self.debug()
-        self.acc.save()
-
+        # self.acc.save()
+        # self.acc.reset_assets()
         risk = QA_Risk(self.acc)
         risk.save()
 
@@ -334,17 +334,18 @@ class QAStrategyCTABase():
         data.data.apply(self.x1, axis=1)
 
     def x1(self, item):
+        use_item = item.copy()
         self.latest_price[item.name[1]] = item['close']
         if str(item.name[0])[0:10] != str(self.running_time)[0:10]:
             self.on_dailyclose()
             self.on_dailyopen()
             if self.market_type == QA.MARKET_TYPE.STOCK_CN:
-                print(f'backtest: Settle! {self.code} {str(item.name[0])[0:10]}')
+                # print(f'backtest: Settle! {self.code} {str(item.name[0])[0:10]}')
                 self.acc.settle()
         self._on_1min_bar()
-        self._market_data.append(item)
+        self._market_data.append(use_item)
         self.running_time = str(item.name[0])
-        self.on_bar(item)
+        self.on_bar(use_item)
 
     def debug_t0(self):
         self.running_mode = 'backtest'

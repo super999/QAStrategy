@@ -12,6 +12,7 @@ import threading
 import requests
 import pandas as pd
 import pymongo
+import re
 from qaenv import (eventmq_ip, eventmq_password, eventmq_port,
                    eventmq_username, mongo_ip)
 
@@ -19,7 +20,7 @@ import QUANTAXIS as QA
 from QUANTAXIS.QAARP import QA_Risk, QA_User
 from QUANTAXIS.QAEngine.QAThreadEngine import QA_Thread
 from QUANTAXIS.QAUtil.QAParameter import MARKET_TYPE, RUNNING_ENVIRONMENT, ORDER_DIRECTION
-from QAPUBSUB.consumer import subscriber_topic,  subscriber_routing
+from QAPUBSUB.consumer import subscriber_topic, subscriber_routing
 from QAPUBSUB.producer import publisher_routing
 from QAStrategy.qactabase import QAStrategyCTABase
 from QIFIAccount import QIFI_Account
@@ -48,7 +49,7 @@ class QAStrategyStockBase(QAStrategyCTABase):
             code {[type]} -- [description]
             frequence {[type]} -- [description]
         """
-        
+
         self.sub = subscriber_topic(exchange='realtime_stock_{}'.format(
             frequence), host=data_host, port=data_port, user=data_user, password=data_password, routing_key='')
         for item in code:
@@ -103,7 +104,6 @@ class QAStrategyStockBase(QAStrategyCTABase):
             self.dt = str(self.new_data['datetime'])[0:16]
             self.isupdate = True
 
-            
         self.acc.on_price_change(self.new_data['code'], self.new_data['close'])
         bar = pd.DataFrame([self.new_data]).set_index(['datetime', 'code']
                                                       ).loc[:, ['open', 'high', 'low', 'close', 'volume']]
@@ -116,7 +116,7 @@ class QAStrategyStockBase(QAStrategyCTABase):
             QA.QA_util_get_real_date(str(datetime.date.today()))), str(datetime.datetime.now()), format='pd', frequence=self.frequence).set_index(['datetime', 'code'])
 
         self._old_data = self._old_data.loc[:, [
-            'open', 'high', 'low', 'close', 'volume']]
+                                                   'open', 'high', 'low', 'close', 'volume']]
 
         self.database = pymongo.MongoClient(mongo_ip).QAREALTIME
 
@@ -145,23 +145,65 @@ class QAStrategyStockBase(QAStrategyCTABase):
         while True:
             pass
 
-
     def debug(self):
         self.running_mode = 'backtest'
         self.database = pymongo.MongoClient(mongo_ip).QUANTAXIS
         user = QA_User(username="admin", password='admin')
         port = user.new_portfolio(self.portfolio)
         self.acc = port.new_accountpro(
-            account_cookie=self.strategy_id, init_cash=self.init_cash, market_type=self.market_type, frequence= self.frequence)
-        #self.positions = self.acc.get_position(self.code)
+            account_cookie=self.strategy_id, init_cash=self.init_cash, market_type=self.market_type, frequence=self.frequence)
+        # self.positions = self.acc.get_position(self.code)
 
         print(self.acc)
 
         print(self.acc.market_type)
+        code_market = self.market_type
+        choose_code = self.code
+        if isinstance(self.code, list):
+            choose_code = self.code[0]
+        if re.match(r'\d+.XSHG', choose_code) is not None:
+            code_market = MARKET_TYPE.INDEX_CN
         data = QA.QA_quotation(self.code, self.start, self.end, source=QA.DATASOURCE.MONGO,
-                               frequence=self.frequence, market=self.market_type, output=QA.OUTPUT_FORMAT.DATASTRUCT)
-
+                               frequence=self.frequence, market=code_market, output=QA.OUTPUT_FORMAT.DATASTRUCT)
         data.data.apply(self.x1, axis=1)
+
+    def debug_qfq(self):
+        self.running_mode = 'backtest'
+        self.database = pymongo.MongoClient(mongo_ip).QUANTAXIS
+        user = QA_User(username="admin", password='admin')
+        port = user.new_portfolio(self.portfolio)
+        self.acc = port.new_accountpro(
+            account_cookie=self.strategy_id, init_cash=self.init_cash, market_type=self.market_type, frequence=self.frequence)
+        # self.positions = self.acc.get_position(self.code)
+        print(self.acc)
+        print(self.acc.market_type)
+        code_market = self.market_type
+        choose_code = self.code
+        if isinstance(self.code, list):
+            choose_code = self.code[0]
+        is_index = False
+        if re.match(r'\d+.XSHG', choose_code) is not None:
+            is_index = True
+        if is_index:
+            code_market = MARKET_TYPE.INDEX_CN
+        data = QA.QA_quotation(self.code, self.start, self.end, source=QA.DATASOURCE.MONGO,
+                               frequence=self.frequence, market=code_market, output=QA.OUTPUT_FORMAT.DATASTRUCT)
+        if not is_index:
+            qfq_data = data.to_qfq()
+            qfq_data.data.apply(self.x1, axis=1)
+        else:
+            data.data.apply(self.x1, axis=1)
+
+    def debug_only_create_account(self):
+        self.running_mode = 'backtest'
+        self.database = pymongo.MongoClient(mongo_ip).QUANTAXIS
+        user = QA_User(username="admin", password='admin')
+        port = user.new_portfolio(self.portfolio)
+        self.acc = port.new_accountpro(
+            account_cookie=self.strategy_id, init_cash=self.init_cash, market_type=self.market_type, frequence=self.frequence)
+        # self.positions = self.acc.get_position(self.code)
+        print(self.acc)
+        print(self.acc.market_type)
 
     def update_account(self):
         if self.running_mode == 'sim':
@@ -175,10 +217,10 @@ class QAStrategyStockBase(QAStrategyCTABase):
             self.trades = self.acc.trades
             self.updatetime = self.acc.dtstr
         elif self.running_mode == 'backtest':
-            #self.positions = self.acc.get_position(self.code)
+            # self.positions = self.acc.get_position(self.code)
             self.positions = self.acc.positions
 
-    def send_order(self,  direction='BUY', offset='OPEN', code=None, price=3925, volume=10, order_id='',):
+    def send_order(self, direction='BUY', offset='OPEN', code=None, price=3925, volume=10, order_id='', ):
 
         towards = eval('ORDER_DIRECTION.{}_{}'.format(direction, offset))
         order_id = str(uuid.uuid4()) if order_id == '' else order_id
@@ -227,8 +269,9 @@ class QAStrategyStockBase(QAStrategyCTABase):
                                         order_offset=OPEN&price=3600&volume=1&order_time=20190909
                             """
 
-                            requests.post('http://www.yutiansut.com/signal?user_id={}&template={}&strategy_id={}&realaccount={}&code={}&order_direction={}&order_offset={}&price={}&volume={}&order_time={}'.format(
-                                user, "xiadan_report", self.strategy_id, self.acc.user_id, code, direction, offset, price, volume, now))
+                            requests.post(
+                                'http://www.yutiansut.com/signal?user_id={}&template={}&strategy_id={}&realaccount={}&code={}&order_direction={}&order_offset={}&price={}&volume={}&order_time={}'.format(
+                                    user, "xiadan_report", self.strategy_id, self.acc.user_id, code, direction, offset, price, volume, now))
                         except Exception as e:
                             QA.QA_util_log_info(e)
 
@@ -241,7 +284,7 @@ class QAStrategyStockBase(QAStrategyCTABase):
 
             self.acc.receive_simpledeal(
                 code=code, trade_time=self.running_time, trade_towards=towards, trade_amount=volume, trade_price=price, order_id=order_id)
-            #self.positions = self.acc.get_position(self.code)
+            # self.positions = self.acc.get_position(self.code)
 
 
 if __name__ == '__main__':
